@@ -252,6 +252,24 @@ export class AuthStorage {
 		return JSON.parse(content) as AuthStorageData;
 	}
 
+	private ensureLoadedForRead(): boolean {
+		if (!this.loadError) {
+			return true;
+		}
+
+		this.reload();
+		return this.loadError === null;
+	}
+
+	private getFallbackApiKey(providerId: string): string | undefined {
+		const envKey = getEnvApiKey(providerId);
+		if (envKey) {
+			return envKey;
+		}
+
+		return this.fallbackResolver?.(providerId) ?? undefined;
+	}
+
 	/**
 	 * Reload credentials from storage.
 	 */
@@ -329,6 +347,10 @@ export class AuthStorage {
 	 * Get credential for a provider.
 	 */
 	get(provider: string): AuthCredential | undefined {
+		if (!this.ensureLoadedForRead()) {
+			return undefined;
+		}
+
 		return this.data[provider] ?? undefined;
 	}
 
@@ -352,6 +374,10 @@ export class AuthStorage {
 	 * List all providers with credentials.
 	 */
 	list(): string[] {
+		if (!this.ensureLoadedForRead()) {
+			return [];
+		}
+
 		return Object.keys(this.data);
 	}
 
@@ -359,6 +385,10 @@ export class AuthStorage {
 	 * Check if credentials exist for a provider in auth.json.
 	 */
 	has(provider: string): boolean {
+		if (!this.ensureLoadedForRead()) {
+			return false;
+		}
+
 		return provider in this.data;
 	}
 
@@ -368,9 +398,8 @@ export class AuthStorage {
 	 */
 	hasAuth(provider: string): boolean {
 		if (this.runtimeOverrides.has(provider)) return true;
-		if (this.data[provider]) return true;
-		if (getEnvApiKey(provider)) return true;
-		if (this.fallbackResolver?.(provider)) return true;
+		if (this.ensureLoadedForRead() && this.data[provider]) return true;
+		if (this.getFallbackApiKey(provider)) return true;
 		return false;
 	}
 
@@ -378,6 +407,10 @@ export class AuthStorage {
 	 * Get all credentials (for passing to getOAuthApiKey).
 	 */
 	getAll(): AuthStorageData {
+		if (!this.ensureLoadedForRead()) {
+			return {};
+		}
+
 		return { ...this.data };
 	}
 
@@ -473,10 +506,13 @@ export class AuthStorage {
 			return runtimeKey;
 		}
 
-		const cred = this.data[providerId];
+		const cred = this.ensureLoadedForRead() ? this.data[providerId] : undefined;
 
 		if (cred?.type === "api_key") {
-			return resolveConfigValue(cred.key);
+			const resolvedKey = resolveConfigValue(cred.key);
+			if (resolvedKey) {
+				return resolvedKey;
+			}
 		}
 
 		if (cred?.type === "oauth") {
@@ -508,6 +544,11 @@ export class AuthStorage {
 						return provider.getApiKey(updatedCred);
 					}
 
+					const fallbackApiKey = this.getFallbackApiKey(providerId);
+					if (fallbackApiKey) {
+						return fallbackApiKey;
+					}
+
 					if (options?.throwOnRefreshError) {
 						throw refreshError;
 					}
@@ -522,12 +563,7 @@ export class AuthStorage {
 			}
 		}
 
-		// Fall back to environment variable
-		const envKey = getEnvApiKey(providerId);
-		if (envKey) return envKey;
-
-		// Fall back to custom resolver (e.g., models.json custom providers)
-		return this.fallbackResolver?.(providerId) ?? undefined;
+		return this.getFallbackApiKey(providerId);
 	}
 
 	/**

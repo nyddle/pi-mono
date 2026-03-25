@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { registerOAuthProvider } from "@mariozechner/pi-ai/oauth";
+import { registerOAuthProvider, resetOAuthProviders } from "@mariozechner/pi-ai/oauth";
 import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
@@ -23,6 +23,7 @@ describe("AuthStorage", () => {
 			rmSync(tempDir, { recursive: true });
 		}
 		clearConfigValueCache();
+		resetOAuthProviders();
 		vi.restoreAllMocks();
 	});
 
@@ -378,6 +379,48 @@ describe("AuthStorage", () => {
 				"scope data format invalid",
 			);
 		});
+
+		test("falls back to environment auth when OAuth refresh fails for an active request", async () => {
+			const originalEnv = process.env.ANTHROPIC_API_KEY;
+			process.env.ANTHROPIC_API_KEY = "env-api-key-value";
+
+			try {
+				registerOAuthProvider({
+					id: "anthropic",
+					name: "Anthropic",
+					async login() {
+						throw new Error("Not used in this test");
+					},
+					async refreshToken() {
+						throw new Error("scope data format invalid");
+					},
+					getApiKey(credentials) {
+						return `Bearer ${credentials.access}`;
+					},
+				});
+
+				writeAuthJson({
+					anthropic: {
+						type: "oauth",
+						refresh: "refresh-token",
+						access: "expired-access-token",
+						expires: Date.now() - 10_000,
+					},
+				});
+
+				authStorage = AuthStorage.create(authJsonPath);
+
+				await expect(authStorage.getApiKey("anthropic", { throwOnRefreshError: true })).resolves.toBe(
+					"env-api-key-value",
+				);
+			} finally {
+				if (originalEnv === undefined) {
+					delete process.env.ANTHROPIC_API_KEY;
+				} else {
+					process.env.ANTHROPIC_API_KEY = originalEnv;
+				}
+			}
+		});
 	});
 
 	describe("persistence semantics", () => {
@@ -442,7 +485,7 @@ describe("AuthStorage", () => {
 			expect(raw).toBe("{invalid-json");
 		});
 
-		test("reload records parse errors and drainErrors clears buffer", () => {
+		test("reload records parse errors, clears stale persisted auth, and drainErrors clears buffer", () => {
 			writeAuthJson({
 				anthropic: { type: "api_key", key: "anthropic-key" },
 			});
@@ -452,8 +495,8 @@ describe("AuthStorage", () => {
 
 			authStorage.reload();
 
-			// Keeps previous in-memory data on reload failure
-			expect(authStorage.get("anthropic")).toEqual({ type: "api_key", key: "anthropic-key" });
+			// Do not trust stale persisted auth after a reload parse failure
+			expect(authStorage.get("anthropic")).toBeUndefined();
 
 			const firstDrain = authStorage.drainErrors();
 			expect(firstDrain.length).toBeGreaterThan(0);
@@ -461,6 +504,31 @@ describe("AuthStorage", () => {
 
 			const secondDrain = authStorage.drainErrors();
 			expect(secondDrain).toHaveLength(0);
+		});
+
+		test("ignores stale persisted auth after a reload parse error and uses environment auth", async () => {
+			const originalEnv = process.env.ANTHROPIC_API_KEY;
+			process.env.ANTHROPIC_API_KEY = "env-api-key-value";
+
+			try {
+				writeAuthJson({
+					anthropic: { type: "api_key", key: "stale-anthropic-key" },
+				});
+
+				authStorage = AuthStorage.create(authJsonPath);
+				writeFileSync(authJsonPath, "{invalid-json", "utf-8");
+
+				authStorage.reload();
+
+				await expect(authStorage.getApiKey("anthropic")).resolves.toBe("env-api-key-value");
+				expect(authStorage.hasAuth("anthropic")).toBe(true);
+			} finally {
+				if (originalEnv === undefined) {
+					delete process.env.ANTHROPIC_API_KEY;
+				} else {
+					process.env.ANTHROPIC_API_KEY = originalEnv;
+				}
+			}
 		});
 	});
 
